@@ -1,0 +1,40 @@
+---
+version: '3.5'
+
+services:
+
+  capture:
+    build:
+      dockerfile: go-capture/Dockerfile
+      context: .
+    env_file:
+      - vars.env
+
+  superset:
+    image: doodmanbro/supersetter:0.2.0
+    hostname: superset-container
+    container_name: superset-container
+    env_file:
+      - vars.env
+    ports:
+      - 8080:8080
+    volumes:
+    - ./superset/superset_config.py:/opt/superset/superset_config.py
+    entrypoint: ["dockerize", "-wait", "tcp://superset-database:5432", "-wait", "tcp://redis:6379", "-timeout", "300s"]
+    command: ["/usr/local/bin/run-superset.sh"]
+
+  superset-database:
+    image: postgres:11
+    hostname: superset-database
+    container_name: superset-database
+    environment:
+      POSTGRES_DB: superset_db
+      POSTGRES_PASSWORD: password123
+      POSTGRES_USER: superset_db_user
+
+  redis:
+    image: redis:3.2
+    hostname: redis
+    container_name: redis
+    ports:
+      - 6379:6379
