@@ -8,19 +8,28 @@ import (
 	"github.com/google/gopacket/pcapgo"
 	"log"
 	"os"
-	"strings"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 )
 
 var (
-	snapLength 	uint32		  = 65536 // pcap packet takes unsigned int
-	timeout		time.Duration = 15 * time.Second
-	mutex 		sync.Mutex
+	snapLength uint32 = 65536 // pcap packet takes unsigned int
+	timeout           = 15 * time.Second
+	mutex      sync.Mutex
+	// timer for rotating files
+	timer = make(chan struct{})
+	// interrupt exit signaler
+	exit = make(chan os.Signal, 1)
+	// counting semaphore
+	sema = make(chan struct{}, 50)
+	// "work" cancellation channel
+	done = make(chan struct{})
 )
 
 type PCAPWriter struct {
-	pcapName  	string
+	pcapName    string
 	timeFormat  string
 	destination string
 	handle      *pcap.Handle
@@ -28,31 +37,37 @@ type PCAPWriter struct {
 	writer      *pcapgo.Writer
 }
 
-func (pw *PCAPWriter) handlePacket(p *gopacket.Packet) {}
+// Ran as a goroutine; Handles writing packet information to the PCAPWriter file
+func (pw *PCAPWriter) handlePacket(p gopacket.Packet) {
+	select {
+	// acquire token
+	case sema <- struct{}{}:
+	// poll cancellation
+	case <-done:
+		return
+	}
+	// release token on completion
+	defer func() { <-sema }()
+	time.Sleep(time.Second * 2)
+	//applicationLayer := p.ApplicationLayer()
+	//if applicationLayer != nil {
+	//	//go handlePacket(packet)
+	//	fmt.Println("Application layer/Payload found.")
+	//	fmt.Printf("%s\n", applicationLayer.Payload())
+	//	// Search for a string inside the payload
+	//	if strings.Contains(string(applicationLayer.Payload()), "HTTP") {
+	//		fmt.Println("HTTP found!")
+	//	}
+	//}
+	if err := pw.writer.WritePacket(p.Metadata().CaptureInfo, p.Data()); err != nil {
+		log.Printf("could not write packet to file: %v", err)
+	}
+}
 
 // Generates a PCAP filename based on the current time
 func (pw *PCAPWriter) filename() string {
 	ts := time.Now().UTC().Format(pw.timeFormat)
 	return fmt.Sprintf("%s.%s.%s", pw.pcapName, ts, "pcap")
-}
-
-// Writes packets to the current PCAP file
-func (pw *PCAPWriter) capture(source *gopacket.PacketSource) {
-	for packet := range source.Packets() {
-		applicationLayer := packet.ApplicationLayer()
-		if applicationLayer != nil {
-			//go handlePacket(packet)
-			fmt.Println("Application layer/Payload found.")
-			fmt.Printf("%s\n", applicationLayer.Payload())
-			// Search for a string inside the payload
-			if strings.Contains(string(applicationLayer.Payload()), "HTTP") {
-				fmt.Println("HTTP found!")
-			}
-		}
-		if err := pw.writer.WritePacket(packet.Metadata().CaptureInfo, packet.Data()); err != nil {
-			log.Printf("could not write packet to file: %v", err)
-		}
-	}
 }
 
 // Opens a new file and creates a new pcapgo "Writer" for the file
@@ -106,7 +121,7 @@ func (pw *PCAPWriter) openDevice(device string) error {
 }
 
 // Ran as goroutine; Signals for file rotation based on the current time
-func signal(rotate chan struct{}, interval int) {
+func watch(rotate chan struct{}, interval int) {
 	for {
 		now := time.Now().UTC()
 		switch now.Minute() % interval {
@@ -121,10 +136,11 @@ func signal(rotate chan struct{}, interval int) {
 
 // Entry point for this program
 func Run(pcapName, timeFormat, destination, device string, interval int) error {
+	signal.Notify(exit, os.Interrupt, syscall.SIGTERM)
 	// init PCAPWriter
 	pw := &PCAPWriter{
-		pcapName: pcapName,
-		timeFormat: timeFormat,
+		pcapName:    pcapName,
+		timeFormat:  timeFormat,
 		destination: destination,
 	}
 	// open network device
@@ -138,21 +154,37 @@ func Run(pcapName, timeFormat, destination, device string, interval int) error {
 	// get packet source object for packet iteration
 	source := gopacket.NewPacketSource(pw.handle, pw.handle.LinkType())
 	// start capturing traffic
-	go pw.capture(source)
+	go func(source *gopacket.PacketSource) {
+		packets := source.Packets()
+		for packet := range packets {
+			go pw.handlePacket(packet)
+		}
+	}(source)
 	// start the rotate timer
-	timer := make(chan struct{})
-	go signal(timer, interval)
+	go watch(timer, interval)
+	// multiplex channels
 	for {
 		select {
-		// listen for the rotate signal
+		// listen for the rotate timer
 		case <-timer:
 			//fileToParse := pw.file.Name()
 			// rotate; close the current file and open a new one file
 			pw.rotate()
 			// parse the pcap file that was just closed
 			//go pw.parsePCAP(fileToParse)
-		default:
-			time.Sleep(time.Second)
+
+		// listen for interrupt
+		case <-exit:
+			// send cancellation
+			close(done)
+			// Handle.Close will close the packet source channel
+			pw.handle.Close()
+			// close the current pcap file
+			err := pw.close()
+			if err != nil {
+				log.Printf("could not close pcap file: %v\n", err)
+			}
+			os.Exit(1)
 		}
 	}
 }
