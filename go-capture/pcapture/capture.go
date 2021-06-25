@@ -25,8 +25,6 @@ var (
 	exit = make(chan os.Signal, 1)
 	// counting semaphore
 	sema = make(chan struct{}, 50)
-	// "work" cancellation channel
-	done = make(chan struct{})
 )
 
 type PCAPWriter struct {
