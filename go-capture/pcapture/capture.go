@@ -1,6 +1,7 @@
 package pcapture
 
 import (
+	"context"
 	"fmt"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -38,17 +39,18 @@ type PCAPWriter struct {
 }
 
 // Ran as a goroutine; Handles writing packet information to the PCAPWriter file
-func (pw *PCAPWriter) handlePacket(p gopacket.Packet) {
+func (pw *PCAPWriter) handlePacket(p gopacket.Packet, ctx context.Context) {
 	select {
 	// acquire token
 	case sema <- struct{}{}:
 	// poll cancellation
-	case <-done:
+	case <-ctx.Done():
+		log.Println("cancelled work")
 		return
 	}
 	// release token on completion
 	defer func() { <-sema }()
-	time.Sleep(time.Second * 2)
+	// todo: decrypt application payloads with SSL keys
 	//applicationLayer := p.ApplicationLayer()
 	//if applicationLayer != nil {
 	//	//go handlePacket(packet)
@@ -153,11 +155,14 @@ func Run(pcapName, timeFormat, destination, device string, interval int) error {
 	}
 	// get packet source object for packet iteration
 	source := gopacket.NewPacketSource(pw.handle, pw.handle.LinkType())
+	// create context for goroutines
+	ctx, cancel := context.WithCancel(context.Background())
 	// start capturing traffic
 	go func(source *gopacket.PacketSource) {
+		defer cancel()
 		packets := source.Packets()
 		for packet := range packets {
-			go pw.handlePacket(packet)
+			go pw.handlePacket(packet, ctx)
 		}
 	}(source)
 	// start the rotate timer
@@ -175,8 +180,7 @@ func Run(pcapName, timeFormat, destination, device string, interval int) error {
 
 		// listen for interrupt
 		case <-exit:
-			// send cancellation
-			close(done)
+			cancel()
 			// Handle.Close will close the packet source channel
 			pw.handle.Close()
 			// close the current pcap file
